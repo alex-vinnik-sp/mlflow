@@ -73,6 +73,7 @@ from mlflow.protos.model_registry_pb2 import (
 )
 from mlflow.protos.service_pb2 import (
     AttachModelToGatewayEndpoint,
+    CreateDataset,
     CreateExperiment,
     CreateGatewayEndpoint,
     CreateGatewayEndpointBinding,
@@ -80,6 +81,7 @@ from mlflow.protos.service_pb2 import (
     CreateGatewaySecret,
     CreateLoggedModel,
     CreateRun,
+    DeleteDataset,
     DeleteExperiment,
     DeleteExperimentTag,
     DeleteGatewayEndpoint,
@@ -94,6 +96,7 @@ from mlflow.protos.service_pb2 import (
     DeleteTag,
     DetachModelFromGatewayEndpoint,
     FinalizeLoggedModel,
+    GetDataset,
     GetExperiment,
     GetExperimentByName,
     GetGatewayEndpoint,
@@ -115,6 +118,7 @@ from mlflow.protos.service_pb2 import (
     RegisterScorer,
     RestoreExperiment,
     RestoreRun,
+    SearchEvaluationDatasets,
     SearchExperiments,
     SearchLoggedModels,
     SetExperimentTag,
@@ -841,6 +845,98 @@ def validate_can_search_datasets():
     return True
 
 
+def validate_can_create_dataset():
+    """Checks UPDATE permission on all requested experiments."""
+    data = request.json
+    experiment_ids = data.get("experiment_ids", [])
+
+    # If no experiment_ids provided, allow (handler will use active experiment)
+    if not experiment_ids:
+        return True
+
+    username = authenticate_request().username
+
+    # Check permission for each experiment
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if not permission.can_update:
+            return False
+
+    return True
+
+
+def validate_can_read_dataset():
+    """Checks READ permission on at least one associated experiment."""
+    dataset_id = _get_request_param("dataset_id")
+    username = authenticate_request().username
+
+    # Get experiment IDs associated with this dataset
+    experiment_ids = _get_tracking_store().get_dataset_experiment_ids(dataset_id)
+
+    # If no experiments associated, use default permission
+    if not experiment_ids:
+        default_permission = get_permission(auth_config.default_permission)
+        return default_permission.can_read
+
+    # Check permission on at least one experiment (OR logic)
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if permission.can_read:
+            return True
+
+    return False
+
+
+def validate_can_delete_dataset():
+    """Checks DELETE permission on at least one associated experiment."""
+    dataset_id = _get_request_param("dataset_id")
+    username = authenticate_request().username
+
+    # Get experiment IDs associated with this dataset
+    experiment_ids = _get_tracking_store().get_dataset_experiment_ids(dataset_id)
+
+    # If no experiments associated, use default permission
+    if not experiment_ids:
+        default_permission = get_permission(auth_config.default_permission)
+        return default_permission.can_delete
+
+    # Check permission on at least one experiment (OR logic)
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if permission.can_delete:
+            return True
+
+    return False
+
+
+def validate_can_search_evaluation_datasets():
+    """Checks READ permission on all requested experiments."""
+    data = request.json
+    experiment_ids = data.get("experiment_ids", [])
+
+    # If no experiment_ids provided, allow (search will return all datasets user can access)
+    if not experiment_ids:
+        return True
+
+    username = authenticate_request().username
+
+    # Check permission for each experiment
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if not permission.can_read:
+            return False
+
+    return True
+
+
 def validate_can_create_promptlab_run():
     """Checks UPDATE permission on the experiment."""
     data = request.json
@@ -914,6 +1010,11 @@ BEFORE_REQUEST_HANDLERS = {
     GetScorer: validate_can_read_scorer,
     DeleteScorer: validate_can_delete_scorer,
     ListScorerVersions: validate_can_read_scorer,
+    # Routes for evaluation datasets
+    CreateDataset: validate_can_create_dataset,
+    GetDataset: validate_can_read_dataset,
+    DeleteDataset: validate_can_delete_dataset,
+    SearchEvaluationDatasets: validate_can_search_evaluation_datasets,
     # Routes for gateway secrets
     GetGatewaySecretInfo: validate_can_read_gateway_secret,
     UpdateGatewaySecret: validate_can_update_gateway_secret,
