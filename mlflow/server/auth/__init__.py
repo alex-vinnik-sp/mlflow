@@ -73,6 +73,8 @@ from mlflow.protos.model_registry_pb2 import (
 )
 from mlflow.protos.service_pb2 import (
     AttachModelToGatewayEndpoint,
+    BatchGetTraces,
+    CalculateTraceFilterCorrelation,
     CreateExperiment,
     CreateGatewayEndpoint,
     CreateGatewayEndpointBinding,
@@ -92,6 +94,9 @@ from mlflow.protos.service_pb2 import (
     DeleteRun,
     DeleteScorer,
     DeleteTag,
+    DeleteTraceTagV3,
+    DeleteTraces,
+    DeleteTracesV3,
     DetachModelFromGatewayEndpoint,
     FinalizeLoggedModel,
     GetExperiment,
@@ -103,24 +108,32 @@ from mlflow.protos.service_pb2 import (
     GetMetricHistory,
     GetRun,
     GetScorer,
+    GetTrace,
+    GetTraceInfoV3,
     ListArtifacts,
     ListGatewayEndpointBindings,
     ListScorers,
     ListScorerVersions,
+    LinkPromptsToTrace,
+    LinkTracesToRun,
     LogBatch,
     LogLoggedModelParamsRequest,
     LogMetric,
     LogModel,
     LogParam,
+    QueryTraceMetrics,
     RegisterScorer,
     RestoreExperiment,
     RestoreRun,
     SearchExperiments,
     SearchLoggedModels,
+    SearchTracesV3,
     SetExperimentTag,
     SetGatewayEndpointTag,
     SetLoggedModelTags,
     SetTag,
+    SetTraceTagV3,
+    StartTraceV3,
     UpdateExperiment,
     UpdateGatewayEndpoint,
     UpdateGatewayModelDefinition,
@@ -768,6 +781,32 @@ def _get_permission_from_trace_request_id() -> Permission:
     )
 
 
+def _get_experiment_id_from_trace_id(trace_id: str) -> str | None:
+    """
+    Get experiment_id from a trace_id.
+    Returns None if trace has no experiment_id.
+    """
+    trace = _get_tracking_store().get_trace_info(trace_id)
+    return trace.experiment_id
+
+
+def _get_permission_from_trace_id(trace_id: str) -> Permission:
+    """
+    Get permission for a trace by trace_id.
+    Traces inherit permissions from their parent experiment.
+    """
+    experiment_id = _get_experiment_id_from_trace_id(trace_id)
+    if not experiment_id:
+        # If trace has no experiment_id, use default permission
+        default_permission = get_permission(auth_config.default_permission)
+        return default_permission
+    
+    username = authenticate_request().username
+    return _get_permission_from_store_or_default(
+        lambda: store.get_experiment_permission(experiment_id, username).permission
+    )
+
+
 def validate_can_read_trace_artifact():
     """Checks READ permission on trace artifacts."""
     return _get_permission_from_trace_request_id().can_read
@@ -838,6 +877,235 @@ def validate_can_search_datasets():
         if not permission.can_read:
             return False
 
+    return True
+
+
+def validate_can_read_trace():
+    """Checks READ permission on trace."""
+    data = request.json
+    trace_id = data.get("trace_id")
+    if not trace_id:
+        raise MlflowException(
+            "GetTrace request must specify trace_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    return _get_permission_from_trace_id(trace_id).can_read
+
+
+def validate_can_read_trace_info():
+    """Checks READ permission on trace info."""
+    trace_id = _get_request_param("trace_id")
+    return _get_permission_from_trace_id(trace_id).can_read
+
+
+def validate_can_batch_get_traces():
+    """Checks READ permission on all requested traces."""
+    data = request.json
+    trace_ids = data.get("trace_ids", [])
+    if not trace_ids:
+        raise MlflowException(
+            "BatchGetTraces request must specify at least one trace_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    
+    username = authenticate_request().username
+    
+    # Check permission for each trace
+    for trace_id in trace_ids:
+        experiment_id = _get_experiment_id_from_trace_id(trace_id)
+        if not experiment_id:
+            # If trace has no experiment_id, use default permission
+            default_permission = get_permission(auth_config.default_permission)
+            if not default_permission.can_read:
+                return False
+            continue
+        
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if not permission.can_read:
+            return False
+    
+    return True
+
+
+def validate_can_search_traces():
+    """Checks READ permission on all requested experiments."""
+    data = request.json
+    locations = data.get("locations", [])
+    if not locations:
+        raise MlflowException(
+            "SearchTracesV3 request must specify at least one location.",
+            INVALID_PARAMETER_VALUE,
+        )
+    
+    # Extract experiment_ids from locations (locations is array of TraceLocation protobuf objects)
+    # In JSON, this would be: [{"mlflow_experiment": {"experiment_id": "123"}}, ...]
+    experiment_ids = []
+    for location in locations:
+        if isinstance(location, dict):
+            mlflow_experiment = location.get("mlflow_experiment", {})
+            if isinstance(mlflow_experiment, dict):
+                experiment_id = mlflow_experiment.get("experiment_id")
+                if experiment_id:
+                    experiment_ids.append(experiment_id)
+    
+    if not experiment_ids:
+        # If no experiment_ids in locations, allow (search will return all traces user can access)
+        return True
+    
+    username = authenticate_request().username
+    
+    # Check permission for each experiment
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if not permission.can_read:
+            return False
+    
+    return True
+
+
+def validate_can_start_trace():
+    """Checks UPDATE permission on experiment if specified in trace."""
+    data = request.json
+    trace = data.get("trace", {})
+    if not trace:
+        # If no trace provided, allow (handler will validate)
+        return True
+    
+    trace_info = trace.get("trace_info", {})
+    if not trace_info:
+        # If no trace_info, allow (handler will use default experiment)
+        return True
+    
+    trace_location = trace_info.get("trace_location", {})
+    if not trace_location:
+        # If no trace_location, allow (handler will use default experiment)
+        return True
+    
+    mlflow_experiment = trace_location.get("mlflow_experiment", {})
+    if not mlflow_experiment:
+        # If no mlflow_experiment, allow (handler will use default experiment)
+        return True
+    
+    experiment_id = mlflow_experiment.get("experiment_id")
+    
+    # If no experiment_id provided, allow (handler will use default experiment)
+    if not experiment_id:
+        return True
+    
+    username = authenticate_request().username
+    permission = _get_permission_from_store_or_default(
+        lambda: store.get_experiment_permission(experiment_id, username).permission
+    )
+    return permission.can_update
+
+
+def validate_can_delete_traces():
+    """Checks DELETE permission on experiment."""
+    data = request.json
+    experiment_id = data.get("experiment_id")
+    if not experiment_id:
+        raise MlflowException(
+            "DeleteTraces request must specify experiment_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    
+    username = authenticate_request().username
+    permission = _get_permission_from_store_or_default(
+        lambda: store.get_experiment_permission(experiment_id, username).permission
+    )
+    return permission.can_delete
+
+
+def validate_can_set_trace_tag():
+    """Checks UPDATE permission on trace."""
+    trace_id = _get_request_param("trace_id")
+    return _get_permission_from_trace_id(trace_id).can_update
+
+
+def validate_can_delete_trace_tag():
+    """Checks DELETE permission on trace."""
+    trace_id = _get_request_param("trace_id")
+    return _get_permission_from_trace_id(trace_id).can_delete
+
+
+def validate_can_link_traces_to_run():
+    """Checks UPDATE permission on run's experiment."""
+    data = request.json
+    run_id = data.get("run_id")
+    if not run_id:
+        raise MlflowException(
+            "LinkTracesToRun request must specify run_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    
+    run = _get_tracking_store().get_run(run_id)
+    experiment_id = run.info.experiment_id
+    username = authenticate_request().username
+    permission = _get_permission_from_store_or_default(
+        lambda: store.get_experiment_permission(experiment_id, username).permission
+    )
+    return permission.can_update
+
+
+def validate_can_link_prompts_to_trace():
+    """Checks UPDATE permission on trace."""
+    data = request.json
+    trace_id = data.get("trace_id")
+    if not trace_id:
+        raise MlflowException(
+            "LinkPromptsToTrace request must specify trace_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    return _get_permission_from_trace_id(trace_id).can_update
+
+
+def validate_can_query_trace_metrics():
+    """Checks READ permission on all requested experiments."""
+    data = request.json
+    experiment_ids = data.get("experiment_ids", [])
+    if not experiment_ids:
+        raise MlflowException(
+            "QueryTraceMetrics request must specify at least one experiment_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    
+    username = authenticate_request().username
+    
+    # Check permission for each experiment
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if not permission.can_read:
+            return False
+    
+    return True
+
+
+def validate_can_calculate_trace_filter_correlation():
+    """Checks READ permission on all requested experiments."""
+    data = request.json
+    experiment_ids = data.get("experiment_ids", [])
+    if not experiment_ids:
+        raise MlflowException(
+            "CalculateTraceFilterCorrelation request must specify at least one experiment_id.",
+            INVALID_PARAMETER_VALUE,
+        )
+    
+    username = authenticate_request().username
+    
+    # Check permission for each experiment
+    for experiment_id in experiment_ids:
+        permission = _get_permission_from_store_or_default(
+            lambda eid=experiment_id: store.get_experiment_permission(eid, username).permission
+        )
+        if not permission.can_read:
+            return False
+    
     return True
 
 
@@ -914,6 +1182,20 @@ BEFORE_REQUEST_HANDLERS = {
     GetScorer: validate_can_read_scorer,
     DeleteScorer: validate_can_delete_scorer,
     ListScorerVersions: validate_can_read_scorer,
+    # Routes for traces
+    GetTrace: validate_can_read_trace,
+    GetTraceInfoV3: validate_can_read_trace_info,
+    BatchGetTraces: validate_can_batch_get_traces,
+    SearchTracesV3: validate_can_search_traces,
+    StartTraceV3: validate_can_start_trace,
+    DeleteTraces: validate_can_delete_traces,
+    DeleteTracesV3: validate_can_delete_traces,
+    SetTraceTagV3: validate_can_set_trace_tag,
+    DeleteTraceTagV3: validate_can_delete_trace_tag,
+    LinkTracesToRun: validate_can_link_traces_to_run,
+    LinkPromptsToTrace: validate_can_link_prompts_to_trace,
+    QueryTraceMetrics: validate_can_query_trace_metrics,
+    CalculateTraceFilterCorrelation: validate_can_calculate_trace_filter_correlation,
     # Routes for gateway secrets
     GetGatewaySecretInfo: validate_can_read_gateway_secret,
     UpdateGatewaySecret: validate_can_update_gateway_secret,
